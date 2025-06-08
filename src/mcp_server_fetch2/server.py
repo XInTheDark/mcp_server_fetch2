@@ -20,6 +20,12 @@ from mcp.types import (
 from protego import Protego
 from pydantic import BaseModel, Field, AnyUrl
 
+import tempfile
+import os
+import asyncio
+from markitdown import MarkItDown
+from cachetools import TTLCache
+
 DEFAULT_USER_AGENT_AUTONOMOUS = "ModelContextProtocol/1.0 (Autonomous; +https://github.com/modelcontextprotocol/servers)"
 DEFAULT_USER_AGENT_MANUAL = "ModelContextProtocol/1.0 (User-Specified; +https://github.com/modelcontextprotocol/servers)"
 
@@ -108,6 +114,30 @@ async def check_may_autonomously_fetch_url(url: str, user_agent: str, proxy_url:
         ))
 
 
+async def extract_content_from_pdf(data: bytes, url: str) -> str:
+    """Extract text content from PDF data, with caching."""
+    if url in _pdf_cache:
+        return _pdf_cache[url]
+    def convert_pdf():
+        md = MarkItDown()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(data)
+            tmp.flush()
+            tmp_path = tmp.name
+        try:
+            result = md.convert(tmp_path)
+            return result.text_content
+        finally:
+            os.remove(tmp_path)
+    text = await asyncio.to_thread(convert_pdf)
+    _pdf_cache[url] = text[:10_000_000]
+    return text
+
+
+# Cache for PDF text content with 10-minute TTL
+_pdf_cache = TTLCache(maxsize=20, ttl=600)
+
+
 async def fetch_url(
     url: str, user_agent: str, force_raw: bool = False, proxy_url: str | None = None
 ) -> Tuple[str, str]:
@@ -133,8 +163,16 @@ async def fetch_url(
             ))
 
         page_raw = response.text
+        raw_bytes = response.content
 
     content_type = response.headers.get("content-type", "")
+    # Detect PDF files
+    is_pdf = "application/pdf" in content_type.lower() or url.lower().endswith(".pdf") or raw_bytes.startswith(b"%PDF-")
+    if is_pdf:
+        # Extract PDF text
+        text = await extract_content_from_pdf(raw_bytes, url)
+        return text, ""
+
     is_page_html = (
         "<html" in page_raw[:100] or "text/html" in content_type or not content_type
     )
