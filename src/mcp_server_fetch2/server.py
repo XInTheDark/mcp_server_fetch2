@@ -139,14 +139,14 @@ _pdf_cache = TTLCache(maxsize=20, ttl=600)
 
 
 async def fetch_url(
-    url: str, user_agent: str, force_raw: bool = False, proxy_url: str | None = None
+    url: str, user_agent: str, force_raw: bool = False, proxy_url: str | None = None, verify_ssl: bool = False
 ) -> Tuple[str, str]:
     """
     Fetch the URL and return the content in a form ready for the LLM, as well as a prefix string with status information.
     """
     from httpx import AsyncClient, HTTPError
 
-    async with AsyncClient(proxies=proxy_url) as client:
+    async with AsyncClient(proxies=proxy_url, verify=verify_ssl) as client:
         try:
             response = await client.get(
                 url,
