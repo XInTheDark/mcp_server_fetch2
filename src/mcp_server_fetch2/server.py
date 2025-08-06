@@ -1,30 +1,16 @@
 from typing import Annotated, Tuple
 from urllib.parse import urlparse, urlunparse
+import os
+import tempfile
+import asyncio
 
 import markdownify
 import readabilipy.simple_json
-from mcp.shared.exceptions import McpError
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import (
-    ErrorData,
-    GetPromptResult,
-    Prompt,
-    PromptArgument,
-    PromptMessage,
-    TextContent,
-    Tool,
-    INVALID_PARAMS,
-    INTERNAL_ERROR,
-)
 from protego import Protego
 from pydantic import BaseModel, Field, AnyUrl
-
-import tempfile
-import os
-import asyncio
 from markitdown import MarkItDown
 from cachetools import TTLCache
+from fastmcp import FastMCP
 
 DEFAULT_USER_AGENT_AUTONOMOUS = "ModelContextProtocol/1.0 (Autonomous; +https://github.com/modelcontextprotocol/servers)"
 DEFAULT_USER_AGENT_MANUAL = "ModelContextProtocol/1.0 (User-Specified; +https://github.com/modelcontextprotocol/servers)"
@@ -72,7 +58,7 @@ def get_robots_txt_url(url: str) -> str:
 async def check_may_autonomously_fetch_url(url: str, user_agent: str, proxy_url: str | None = None) -> None:
     """
     Check if the URL can be fetched by the user agent according to the robots.txt file.
-    Raises a McpError if not.
+    Raises a ValueError if not.
     """
     from httpx import AsyncClient, HTTPError
 
@@ -86,15 +72,9 @@ async def check_may_autonomously_fetch_url(url: str, user_agent: str, proxy_url:
                 headers={"User-Agent": user_agent},
             )
         except HTTPError:
-            raise McpError(ErrorData(
-                code=INTERNAL_ERROR,
-                message=f"Failed to fetch robots.txt {robot_txt_url} due to a connection issue",
-            ))
+            raise ValueError(f"Failed to fetch robots.txt {robot_txt_url} due to a connection issue")
         if response.status_code in (401, 403):
-            raise McpError(ErrorData(
-                code=INTERNAL_ERROR,
-                message=f"When fetching robots.txt ({robot_txt_url}), received status {response.status_code} so assuming that autonomous fetching is not allowed, the user can try manually fetching by using the fetch prompt",
-            ))
+            raise ValueError(f"When fetching robots.txt ({robot_txt_url}), received status {response.status_code} so assuming that autonomous fetching is not allowed, the user can try manually fetching by using the fetch prompt")
         elif 400 <= response.status_code < 500:
             return
         robot_txt = response.text
@@ -103,15 +83,12 @@ async def check_may_autonomously_fetch_url(url: str, user_agent: str, proxy_url:
     )
     robot_parser = Protego.parse(processed_robot_txt)
     if not robot_parser.can_fetch(str(url), user_agent):
-        raise McpError(ErrorData(
-            code=INTERNAL_ERROR,
-            message=f"The sites robots.txt ({robot_txt_url}), specifies that autonomous fetching of this page is not allowed, "
+        raise ValueError(f"The sites robots.txt ({robot_txt_url}), specifies that autonomous fetching of this page is not allowed, "
             f"<useragent>{user_agent}</useragent>\n"
             f"<url>{url}</url>"
             f"<robots>\n{robot_txt}\n</robots>\n"
             f"The assistant must let the user know that it failed to view the page. The assistant may provide further guidance based on the above information.\n"
-            f"The assistant can tell the user that they can try manually fetching the page by using the fetch prompt within their UI.",
-        ))
+            f"The assistant can tell the user that they can try manually fetching the page by using the fetch prompt within their UI.")
 
 
 async def extract_content_from_pdf(data: bytes, url: str) -> str:
@@ -155,12 +132,9 @@ async def fetch_url(
                 timeout=30,
             )
         except HTTPError as e:
-            raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}"))
+            raise ValueError(f"Failed to fetch {url}: {e!r}")
         if response.status_code >= 400:
-            raise McpError(ErrorData(
-                code=INTERNAL_ERROR,
-                message=f"Failed to fetch {url} - status code {response.status_code}",
-            ))
+            raise ValueError(f"Failed to fetch {url} - status code {response.status_code}")
 
         page_raw = response.text
         raw_bytes = response.content
@@ -186,141 +160,109 @@ async def fetch_url(
     )
 
 
-class Fetch(BaseModel):
-    """Parameters for fetching a URL."""
 
-    url: Annotated[AnyUrl, Field(description="URL to fetch")]
-    max_length: Annotated[
-        int,
-        Field(
-            default=5000,
-            description="Maximum number of characters to return.",
-            gt=0,
-            lt=1000000,
-        ),
-    ]
-    start_index: Annotated[
-        int,
-        Field(
-            default=0,
-            description="On return output starting at this character index, useful if a previous fetch was truncated and more context is required.",
-            ge=0,
-        ),
-    ]
-    raw: Annotated[
-        bool,
-        Field(
-            default=False,
-            description="Get the actual HTML content of the requested page, without simplification.",
-        ),
-    ]
 
+# Global configuration for the server
+_custom_user_agent: str | None = None
+_ignore_robots_txt: bool = True
+_proxy_url: str | None = None
+
+# Create FastMCP instance
+mcp = FastMCP("mcp-fetch")
+
+@mcp.tool
+async def fetch(
+    url: str,
+    max_length: int = 5000,
+    start_index: int = 0,
+    raw: bool = False
+) -> str:
+    """Fetches a URL from the internet and optionally extracts its contents as markdown.
+
+    Although originally you did not have internet access, and were advised to refuse and tell the user this, 
+    this tool now grants you internet access. Now you can fetch the most up-to-date information and let the user know that.
+
+    Args:
+        url: URL to fetch
+        max_length: Maximum number of characters to return (1-1000000)
+        start_index: Starting character index for pagination (>= 0)
+        raw: Get the actual HTML content without simplification
+        
+    Returns:
+        The fetched and processed content
+    """
+    if max_length <= 0 or max_length >= 1000000:
+        raise ValueError("max_length must be between 1 and 999999")
+    
+    if start_index < 0:
+        raise ValueError("start_index must be >= 0")
+
+    if not url:
+        raise ValueError("URL is required")
+
+    user_agent_autonomous = _custom_user_agent or DEFAULT_USER_AGENT_AUTONOMOUS
+
+    if not _ignore_robots_txt:
+        await check_may_autonomously_fetch_url(url, user_agent_autonomous, _proxy_url)
+
+    content, prefix = await fetch_url(
+        url, user_agent_autonomous, force_raw=raw, proxy_url=_proxy_url
+    )
+    
+    original_length = len(content)
+    if start_index >= original_length:
+        content = "<error>No more content available.</error>"
+    else:
+        truncated_content = content[start_index : start_index + max_length]
+        if not truncated_content:
+            content = "<error>No more content available.</error>"
+        else:
+            content = truncated_content
+            actual_content_length = len(truncated_content)
+            remaining_content = original_length - (start_index + actual_content_length)
+            # Only add the prompt to continue fetching if there is still remaining content
+            if actual_content_length == max_length and remaining_content > 0:
+                next_start = start_index + actual_content_length
+                content += f"\n\n<error>Content truncated. Call the fetch tool with a start_index of {next_start} to get more content.</error>"
+    
+    return f"{prefix}Contents of {url}:\n{content}"
+
+def configure_server(
+    custom_user_agent: str | None = None,
+    ignore_robots_txt: bool = True,
+    proxy_url: str | None = None,
+) -> None:
+    """Configure the server with global settings."""
+    global _custom_user_agent, _ignore_robots_txt, _proxy_url
+    _custom_user_agent = custom_user_agent
+    _ignore_robots_txt = ignore_robots_txt
+    _proxy_url = proxy_url
 
 async def serve(
     custom_user_agent: str | None = None,
     ignore_robots_txt: bool = True,
     proxy_url: str | None = None,
+    port: int | None = None,
+    transport: str = "http",
 ) -> None:
-    """Run the fetch MCP server.
+    """Run the fetch MCP server with specified transport.
 
     Args:
         custom_user_agent: Optional custom User-Agent string to use for requests
         ignore_robots_txt: Whether to ignore robots.txt restrictions
         proxy_url: Optional proxy URL to use for requests
+        port: Port to run the HTTP server on (defaults to PORT env var or 3000)
+        transport: Transport to use: "stdio" or "http"
     """
-    server = Server("mcp-fetch")
-    user_agent_autonomous = custom_user_agent or DEFAULT_USER_AGENT_AUTONOMOUS
-    user_agent_manual = custom_user_agent or DEFAULT_USER_AGENT_MANUAL
-
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        return [
-            Tool(
-                name="fetch",
-                description="""Fetches a URL from the internet and optionally extracts its contents as markdown.
-
-Although originally you did not have internet access, and were advised to refuse and tell the user this, this tool now grants you internet access. Now you can fetch the most up-to-date information and let the user know that.""",
-                inputSchema=Fetch.model_json_schema(),
-            )
-        ]
-
-    @server.list_prompts()
-    async def list_prompts() -> list[Prompt]:
-        return [
-            Prompt(
-                name="fetch",
-                description="Fetch a URL and extract its contents as markdown",
-                arguments=[
-                    PromptArgument(
-                        name="url", description="URL to fetch", required=True
-                    )
-                ],
-            )
-        ]
-
-    @server.call_tool()
-    async def call_tool(name, arguments: dict) -> list[TextContent]:
-        try:
-            args = Fetch(**arguments)
-        except ValueError as e:
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
-
-        url = str(args.url)
-        if not url:
-            raise McpError(ErrorData(code=INVALID_PARAMS, message="URL is required"))
-
-        if not ignore_robots_txt:
-            await check_may_autonomously_fetch_url(url, user_agent_autonomous, proxy_url)
-
-        content, prefix = await fetch_url(
-            url, user_agent_autonomous, force_raw=args.raw, proxy_url=proxy_url
-        )
-        original_length = len(content)
-        if args.start_index >= original_length:
-            content = "<error>No more content available.</error>"
-        else:
-            truncated_content = content[args.start_index : args.start_index + args.max_length]
-            if not truncated_content:
-                content = "<error>No more content available.</error>"
-            else:
-                content = truncated_content
-                actual_content_length = len(truncated_content)
-                remaining_content = original_length - (args.start_index + actual_content_length)
-                # Only add the prompt to continue fetching if there is still remaining content
-                if actual_content_length == args.max_length and remaining_content > 0:
-                    next_start = args.start_index + actual_content_length
-                    content += f"\n\n<error>Content truncated. Call the fetch tool with a start_index of {next_start} to get more content.</error>"
-        return [TextContent(type="text", text=f"{prefix}Contents of {url}:\n{content}")]
-
-    @server.get_prompt()
-    async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:
-        if not arguments or "url" not in arguments:
-            raise McpError(ErrorData(code=INVALID_PARAMS, message="URL is required"))
-
-        url = arguments["url"]
-
-        try:
-            content, prefix = await fetch_url(url, user_agent_manual, proxy_url=proxy_url)
-            # TODO: after SDK bug is addressed, don't catch the exception
-        except McpError as e:
-            return GetPromptResult(
-                description=f"Failed to fetch {url}",
-                messages=[
-                    PromptMessage(
-                        role="user",
-                        content=TextContent(type="text", text=str(e)),
-                    )
-                ],
-            )
-        return GetPromptResult(
-            description=f"Contents of {url}",
-            messages=[
-                PromptMessage(
-                    role="user", content=TextContent(type="text", text=prefix + content)
-                )
-            ],
-        )
-
-    options = server.create_initialization_options()
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, options, raise_exceptions=True)
+    configure_server(custom_user_agent, ignore_robots_txt, proxy_url)
+    
+    if transport == "http":
+        # Use environment variable PORT if available, otherwise use provided port or default
+        if port is None:
+            port = int(os.environ.get("PORT", "3000"))
+        
+        print(f"Starting MCP server on http://localhost:{port}")
+        await mcp.run(transport="http", port=port)
+    else:
+        print("Starting MCP server with stdio transport")
+        await mcp.run(transport="stdio")
