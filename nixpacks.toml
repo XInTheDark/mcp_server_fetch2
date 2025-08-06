@@ -1,0 +1,13 @@
+[phases.setup]
+nixPkgs = ["uv"]
+
+[phases.install]
+cmds = [
+    "uv sync --frozen"
+]
+
+[start]
+cmd = "uv run python -m mcp_server_fetch2 --transport http"
+
+[variables]
+PORT = "3000"
