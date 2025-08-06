@@ -3,7 +3,7 @@ nixPkgs = ["uv"]
 
 [phases.install]
 cmds = [
-    "uv sync --frozen"
+    "uv sync"
 ]
 
 [start]
