@@ -262,7 +262,7 @@ async def serve(
             port = int(os.environ.get("PORT", "3000"))
         
         print(f"Starting MCP server on http://localhost:{port}")
-        await mcp.run(transport="http", port=port)
+        mcp.run(transport="http", port=port)
     else:
         print("Starting MCP server with stdio transport")
-        await mcp.run(transport="stdio")
+        mcp.run(transport="stdio")
